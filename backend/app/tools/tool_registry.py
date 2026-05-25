@@ -1,16 +1,18 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 
 def classify_prompt(prompt: str):
     p = prompt.lower()
     if "expire" in p and "next week" in p:
         return "count_expiring_certificates", {"days": 7}
-    if "expiring" in p and "30" in p:
+    if "expire" in p and "30" in p:
         return "get_expiring_certificates", {"days": 30}
     if "expired" in p:
-        return "get_expiring_certificates", {"days": 0}
+        return "get_expired_certificates", {}
     if "failed" in p and "job" in p:
         return "get_failed_orchestrator_jobs", {}
+    if "inventory" in p or "summary" in p:
+        return "get_certificate_inventory_summary", {}
     return "get_certificate_inventory_summary", {}
 
 

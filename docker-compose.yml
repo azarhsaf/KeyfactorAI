@@ -34,7 +34,7 @@ services:
   frontend:
     build: ./frontend
     expose:
-      - "5173"
+      - "80"
 
   nginx:
     image: nginx:1.27-alpine

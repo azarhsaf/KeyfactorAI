@@ -18,3 +18,4 @@ class ChatResponse(BaseModel):
     timestamp: str
     tool: str
     table: list[dict[str, Any]]
+    diagnostics: dict[str, Any] | None = None
