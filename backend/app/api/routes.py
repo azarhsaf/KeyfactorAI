@@ -8,7 +8,7 @@ from app.core.db import get_db
 from app.models.audit import AuditLog
 from app.services.keyfactor_client import KeyfactorClient
 from app.services.llm_service import summarize_with_llm, ollama_diagnostics
-from app.tools.tool_registry import classify_prompt, now_iso, normalize_rows, to_table, group_count
+from app.tools.tool_registry import classify_prompt, now_iso, normalize_rows, to_table, group_count, GENERAL_PKI, SUPPORTED_QUESTIONS
 
 router = APIRouter()
 
@@ -38,15 +38,7 @@ def keyfactor_diagnostics(db: Session = Depends(get_db)):
         db.execute(text("SELECT 1"))
     except Exception:
         db_ok = False
-    return {
-        "timestamp": now_iso(),
-        "frontend_status": "served_by_nginx",
-        "backend_status": "running",
-        "app_version": settings.app_version,
-        "keyfactor": {**kf.health_check(), "username": kf._masked_username(), "password": "********"},
-        "ollama": ollama_diagnostics(),
-        "database": {"ok": db_ok},
-    }
+    return {"timestamp": now_iso(), "frontend_status": "served_by_nginx", "backend_status": "running", "app_version": settings.app_version, "keyfactor": {**kf.health_check(), "username": kf._masked_username(), "password": "********"}, "ollama": ollama_diagnostics(), "database": {"ok": db_ok}}
 
 
 @router.get("/keyfactor/test-expiring")
@@ -62,45 +54,60 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
     health = kf.health_check()
     source = "Keyfactor Command API"
 
+    if tool == "general_pki_question":
+        answer = GENERAL_PKI.get(params["topic"], "PKI means Public Key Infrastructure.")
+        return ChatResponse(answer=answer, ai_summary=None, source="Controlled PKI Knowledge", tool=tool, result_count=1, ai_summary_status="not_used", timestamp=now_iso(), table=[], diagnostics=None)
+
+    if tool == "invalid_sha128":
+        answer = "SHA-128 is not a standard certificate signature algorithm check supported by this tool. Did you mean SHA1 certificates or weak hash certificates?"
+        return ChatResponse(answer=answer, ai_summary=None, source=source, tool=tool, result_count=0, ai_summary_status="not_used", timestamp=now_iso(), table=[], diagnostics=health)
+
+    if tool == "unsupported":
+        answer = "I could not match this question to a supported Keyfactor tool yet."
+        return ChatResponse(answer=answer, ai_summary="Supported examples: " + "; ".join(SUPPORTED_QUESTIONS), source=source, tool=tool, result_count=0, ai_summary_status="not_used", timestamp=now_iso(), table=[], diagnostics=health)
+
     if not health.get("api_reachable"):
-        return ChatResponse(answer="Network or TLS connectivity issue.", source="unavailable", tool="none", result_count=0, ai_summary_status="not_used", timestamp=now_iso(), table=[], diagnostics=health)
+        return ChatResponse(answer="Network or TLS connectivity issue.", ai_summary=None, source="unavailable", tool="none", result_count=0, ai_summary_status="not_used", timestamp=now_iso(), table=[], diagnostics=health)
 
     all_rows = normalize_rows(kf.list_certificates())
     now = datetime.now(timezone.utc)
     result_rows = []
-    answer = ""
+    deterministic_answer = ""
 
     if tool == "count_expiring_certificates":
         d = params["days"]
-        result_rows = [r for r in all_rows if (lambda dt: dt and now <= dt <= now + timedelta(days=d))( _parse_dt(r.get("NotAfter") or r.get("ExpirationDate")) )]
-        answer = f"Found {len(result_rows)} certificates expiring in the next {d} days."
+        result_rows = [r for r in all_rows if (lambda dt: dt and now <= dt <= now + timedelta(days=d))(_parse_dt(r.get("NotAfter") or r.get("ExpirationDate")))]
+        deterministic_answer = f"Found {len(result_rows)} certificates expiring in the next {d} days."
     elif tool == "get_expiring_certificates":
         d = params["days"]
-        result_rows = [r for r in all_rows if (lambda dt: dt and now <= dt <= now + timedelta(days=d))( _parse_dt(r.get("NotAfter") or r.get("ExpirationDate")) )]
-        answer = f"Found {len(result_rows)} certificates expiring in the next {d} days."
+        result_rows = [r for r in all_rows if (lambda dt: dt and now <= dt <= now + timedelta(days=d))(_parse_dt(r.get("NotAfter") or r.get("ExpirationDate")))]
+        deterministic_answer = f"Found {len(result_rows)} certificates expiring in the next {d} days."
     elif tool == "get_expired_certificates":
         result_rows = [r for r in all_rows if (lambda dt: dt and dt < now)(_parse_dt(r.get("NotAfter") or r.get("ExpirationDate")))]
-        answer = f"Found {len(result_rows)} expired certificates."
+        deterministic_answer = f"Found {len(result_rows)} expired certificates."
     elif tool == "count_expired_certificates":
         result_rows = [r for r in all_rows if (lambda dt: dt and dt < now)(_parse_dt(r.get("NotAfter") or r.get("ExpirationDate")))]
-        answer = f"There are {len(result_rows)} expired certificates."
+        deterministic_answer = f"There are {len(result_rows)} expired certificates."
     elif tool == "sha1_certificates":
         result_rows = [r for r in all_rows if "sha1" in str(r.get("SignatureAlgorithm", "")).lower()]
-        answer = f"Found {len(result_rows)} SHA1 certificates."
+        deterministic_answer = f"Found {len(result_rows)} SHA1 certificates."
+    elif tool == "weak_algorithm_summary":
+        weak_hash = [r for r in all_rows if any(x in str(r.get("SignatureAlgorithm", "")).lower() for x in ["sha1", "md5"])]
+        weak_rsa = [r for r in all_rows if "rsa" in str(r.get("KeyAlgorithm", "")).lower() and _safe_int(r.get("KeySize")) < 2048]
+        result_rows = weak_hash + weak_rsa
+        deterministic_answer = f"Found {len(weak_hash)} weak-hash certificates and {len(weak_rsa)} weak RSA certificates."
     elif tool == "rsa_less_than_2048_certificates":
         result_rows = [r for r in all_rows if "rsa" in str(r.get("KeyAlgorithm", "")).lower() and _safe_int(r.get("KeySize")) < 2048]
-        answer = f"Found {len(result_rows)} RSA certificates with key size less than 2048."
+        deterministic_answer = f"Found {len(result_rows)} RSA certificates with key size less than 2048."
     elif tool == "certificates_without_owner":
         result_rows = [r for r in all_rows if not (r.get("OwnerRoleName") or r.get("Owner"))]
-        answer = f"Found {len(result_rows)} certificates without owner metadata."
+        deterministic_answer = f"Found {len(result_rows)} certificates without owner metadata."
     elif tool == "certificates_by_issuer":
-        grouped = group_count(all_rows, "issuer")
-        answer = f"Found {len(grouped)} issuer groups."
-        result_rows = grouped
+        result_rows = group_count(all_rows, "issuer")
+        deterministic_answer = f"Found {len(result_rows)} issuer groups."
     elif tool == "certificates_by_template":
-        grouped = group_count(all_rows, "template")
-        answer = f"Found {len(grouped)} template groups."
-        result_rows = grouped
+        result_rows = group_count(all_rows, "template")
+        deterministic_answer = f"Found {len(result_rows)} template groups."
     elif tool == "certificates_by_expiry_year":
         years = {}
         for r in all_rows:
@@ -108,7 +115,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
             if dt:
                 years[dt.year] = years.get(dt.year, 0) + 1
         result_rows = [{"year": y, "count": c} for y, c in sorted(years.items())]
-        answer = f"Found expiry distribution across {len(result_rows)} years."
+        deterministic_answer = f"Found expiry distribution across {len(result_rows)} years."
     elif tool == "top_expiring_certificates":
         limit = params.get("limit", 10)
         candidates = []
@@ -118,22 +125,22 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
                 candidates.append((dt, r))
         candidates.sort(key=lambda x: x[0])
         result_rows = [r for _, r in candidates[:limit]]
-        answer = f"Top {len(result_rows)} certificates expiring soon."
+        deterministic_answer = f"Top {len(result_rows)} certificates expiring soon."
     elif tool == "get_failed_orchestrator_jobs":
         jobs = kf.get_orchestrator_jobs()
         result_rows = [r for r in jobs if str(r.get("Status", "")).lower() == "failed"]
-        answer = f"Found {len(result_rows)} failed jobs."
+        deterministic_answer = f"Found {len(result_rows)} failed jobs."
     else:
         result_rows = [{"total_certificates": len(all_rows)}]
-        answer = f"Inventory summary: total certificates = {len(all_rows)}."
+        deterministic_answer = f"Inventory summary: total certificates = {len(all_rows)}."
 
-    final_answer, ai_status = summarize_with_llm(req.prompt, answer)
+    ai_summary, ai_status = summarize_with_llm(req.prompt, deterministic_answer)
     table = result_rows if (result_rows and isinstance(result_rows[0], dict) and ("count" in result_rows[0] or "year" in result_rows[0])) else to_table(result_rows, limit=50)
 
-    db.add(AuditLog(username=req.username, prompt=req.prompt, selected_tool=tool, data_source=source, result_count=len(result_rows), response_summary=final_answer))
+    db.add(AuditLog(username=req.username, prompt=req.prompt, selected_tool=tool, data_source=source, result_count=len(result_rows), response_summary=deterministic_answer))
     db.commit()
 
-    return ChatResponse(answer=final_answer, source=source, tool=tool, result_count=len(result_rows), ai_summary_status=ai_status, timestamp=now_iso(), table=table, diagnostics=health)
+    return ChatResponse(answer=deterministic_answer, ai_summary=ai_summary, source=source, tool=tool, result_count=len(result_rows), ai_summary_status=ai_status, timestamp=now_iso(), table=table, diagnostics=health)
 
 
 @router.get("/audit")

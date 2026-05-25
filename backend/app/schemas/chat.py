@@ -14,6 +14,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+    ai_summary: str | None = None
     source: str
     tool: str
     result_count: int

@@ -2,11 +2,41 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+SUPPORTED_QUESTIONS = [
+    "total certificates",
+    "expired certificates",
+    "certificates expiring next week / 7 days / 30 days",
+    "SHA1 certificates",
+    "weak hash certificates",
+    "RSA less than 2048",
+    "certificates without owner",
+    "certificates by issuer",
+    "certificates by template",
+    "top expiring certificates",
+    "inventory summary",
+    "what is PKI / CA / certificate / CRL / OCSP",
+]
+
+GENERAL_PKI = {
+    "pki": "PKI means Public Key Infrastructure. It is the system used to issue, manage, validate, and revoke digital certificates.",
+    "ca": "A CA is a Certificate Authority that issues and signs digital certificates.",
+    "certificate": "A digital certificate binds an identity to a public key and is used for authentication and encryption.",
+    "crl": "A CRL is a Certificate Revocation List used to publish revoked certificates.",
+    "ocsp": "OCSP is the Online Certificate Status Protocol used to check certificate revocation status in real time.",
+}
+
 
 def classify_prompt(prompt: str):
-    p = prompt.lower()
+    p = prompt.lower().strip()
+    if "sha128" in p:
+        return "invalid_sha128", {}
+    for k in GENERAL_PKI:
+        if f"what is {k}" in p or p == k:
+            return "general_pki_question", {"topic": k}
     if "top" in p and "expiring" in p:
         return "top_expiring_certificates", {"limit": 10}
+    if "total weak" in p or "weak algorithm" in p or "weak hash" in p:
+        return "weak_algorithm_summary", {}
     if ("how many" in p or "count" in p) and "expired" in p:
         return "count_expired_certificates", {}
     if "show" in p and "expired" in p:
@@ -29,9 +59,28 @@ def classify_prompt(prompt: str):
         return "certificates_by_expiry_year", {}
     if "failed" in p and "job" in p:
         return "get_failed_orchestrator_jobs", {}
-    if "inventory" in p:
+    if "inventory" in p or "total certificates" in p:
         return "inventory_summary", {}
-    return "inventory_summary", {}
+    return "unsupported", {}
+
+
+def planner_fallback_json(intent: str, filters: dict[str, Any] | None = None):
+    return {
+        "intent": intent,
+        "method": "GET",
+        "endpoint": "/Certificates",
+        "filters": filters or {
+            "expiry_days": None,
+            "expired": False,
+            "sha1": False,
+            "weak_rsa": False,
+            "owner_missing": False,
+            "template": None,
+            "issuer": None,
+        },
+        "limit": 20,
+        "explanation": "Rule-based fallback intent",
+    }
 
 
 def now_iso():
@@ -56,9 +105,6 @@ def parse_cert_row(r: dict[str, Any]):
         "template": r.get("TemplateName") or r.get("TemplateId"),
         "thumbprint": r.get("Thumbprint"),
         "owner": r.get("OwnerRoleName") or r.get("Owner"),
-        "key_algorithm": str(r.get("KeyAlgorithm") or ""),
-        "key_size": r.get("KeySize"),
-        "signature_algorithm": str(r.get("SignatureAlgorithm") or ""),
     }
 
 
