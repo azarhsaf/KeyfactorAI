@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen2.5:3b-instruct"
     offline_mode: bool = True
     auto_pull_model: bool = False
+    enable_ai_summary: bool = False
 
     local_admin_username: str = "admin"
     local_admin_password: str = "admin123"
