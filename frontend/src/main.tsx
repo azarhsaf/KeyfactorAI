@@ -1,91 +1,74 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
-const qs = [
-  'How many certificates expire next week?',
-  'Show certificates expiring in 30 days.',
-  'Show expired certificates.',
-  'Show failed jobs.',
-  'Show inventory summary.'
-];
+const qs = ['How many certificates expire next week?', 'Show certificates expiring in 30 days.', 'Show expired certificates.', 'Show failed jobs.', 'Show inventory summary.'];
 
-function csv(rows: any[]) {
-  if (!rows.length) return '';
-  const headers = Object.keys(rows[0]);
-  const lines = [headers.join(',')].concat(rows.map(r => headers.map(h => JSON.stringify(r[h] ?? '')).join(',')));
-  return lines.join('\n');
-}
+const cardStyle = { padding: 12, border: '1px solid #d1d5db', borderRadius: 8, background: '#fff' } as React.CSSProperties;
 
 function App() {
   const [prompt, setPrompt] = useState('');
   const [answer, setAnswer] = useState<any>(null);
   const [diag, setDiag] = useState<any>(null);
-  const [expTest, setExpTest] = useState<any>(null);
+  const [mode, setMode] = useState<'light'|'dark'>('light');
+  const [page, setPage] = useState<'chat'|'diagnostics'|'audit'>('chat');
 
-  const loadDiag = async () => {
-    const res = await fetch('/api/keyfactor/diagnostics');
-    setDiag(await res.json());
-  };
-
-  const testExpiring = async () => {
-    const res = await fetch('/api/keyfactor/test-expiring?days=7');
-    setExpTest(await res.json());
-  };
-
+  const loadDiag = async () => setDiag(await (await fetch('/api/keyfactor/diagnostics')).json());
   useEffect(() => { loadDiag(); }, []);
-
   const ask = async (q: string) => {
-    setPrompt(q);
-    const res = await fetch('/api/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ prompt: q, username: 'admin' })});
-    setAnswer(await res.json());
+    const payload = { prompt: q, username: 'admin' };
+    const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    setAnswer(await r.json());
   };
 
-  return <div style={{display:'grid',gridTemplateColumns:'260px 1fr',fontFamily:'Arial',height:'100vh'}}>
-    <aside style={{background:'#111827',color:'white',padding:16}}>
+  const bg = mode === 'dark' ? '#0f172a' : '#f8fafc';
+  const fg = mode === 'dark' ? '#e2e8f0' : '#111827';
+
+  return <div style={{display:'grid',gridTemplateColumns:'250px 1fr',height:'100vh',fontFamily:'Inter,Arial',background:bg,color:fg}}>
+    <aside style={{background: mode==='dark' ? '#111827' : '#1f2937', color:'white', padding:16}}>
       <h2>Keyfactor AI</h2>
-      <p>Version {diag?.app_version || '0.1.0'} (release)</p>
-      <p>Suggested questions</p>
-      {qs.map(q=><button key={q} onClick={()=>ask(q)} style={{display:'block',marginBottom:8,width:'100%'}}>{q}</button>)}
+      <div>Version {diag?.app_version || '0.1.0'} release</div>
+      <div style={{marginTop:12}}>Branding Placeholder</div>
+      <button onClick={()=>setMode(mode==='dark'?'light':'dark')} style={{marginTop:10}}>Toggle {mode==='dark'?'Light':'Dark'}</button>
+      <hr />
+      <button onClick={()=>setPage('chat')}>Chat</button>
+      <button onClick={()=>setPage('diagnostics')}>Diagnostics</button>
+      <button onClick={()=>setPage('audit')}>Audit (placeholder)</button>
     </aside>
-    <main style={{padding:16, overflow:'auto'}}>
-      <h1>Chat Assistant</h1>
-      <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} style={{width:'100%',height:80}} />
-      <button onClick={()=>ask(prompt)}>Ask</button>
-
-      {answer && <div style={{marginTop:16,padding:12,border:'1px solid #ddd'}}>
-        <p><b>Answer:</b> {answer.answer}</p>
-        <p>Source: {answer.source} | Tool: {answer.tool} | Timestamp: {answer.timestamp}</p>
-        {answer.diagnostics && <div style={{background:'#fff7ed',padding:10}}>
-          <b>Connection diagnostics</b>
-          <p>Command reachable: {String(answer.diagnostics.command_reachable)}</p>
-          <p>Auth OK: {String(answer.diagnostics.auth_ok)}</p>
-          <p>Failed URL: {answer.diagnostics.cert_search_url || answer.diagnostics.swagger_url}</p>
-          <p>Status code: {String(answer.diagnostics.cert_search_status || answer.diagnostics.swagger_status)}</p>
-          <p>Recommended fix: {answer.diagnostics.diagnosis}</p>
+    <main style={{padding:16,overflow:'auto'}}>
+      {page === 'chat' && <>
+        <h1>Assistant Chat</h1>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>{qs.map(q=><button key={q} onClick={()=>{setPrompt(q);ask(q);}}>{q}</button>)}</div>
+        <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} style={{width:'100%',height:80,marginTop:8}} />
+        <button onClick={()=>ask(prompt)}>Ask</button>
+        {answer && <div style={{...cardStyle, marginTop:12}}>
+          <b>Answer</b><p>{answer.answer}</p>
+          <p>Source: {answer.source} | Tool: {answer.tool} | Timestamp: {answer.timestamp}</p>
+          {answer.diagnostics && <div style={{...cardStyle, background:'#fff7ed'}}>
+            <p>Command reachable: {String(answer.diagnostics.api_reachable)}</p>
+            <p>Authentication: {String(answer.diagnostics.authenticated)}</p>
+            <p>Endpoint: {answer.diagnostics.endpoint_tested}</p>
+            <p>HTTP: {answer.diagnostics.http_status_code}</p>
+            <p>Message: {answer.diagnostics.message}</p>
+          </div>}
         </div>}
-        <button onClick={()=>{const blob=new Blob([csv(answer.table||[])],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='results.csv';a.click();}}>Export CSV</button>
-        <table border={1}><thead><tr>{answer.table?.[0] && Object.keys(answer.table[0]).map((h:string)=><th key={h}>{h}</th>)}</tr></thead>
-        <tbody>{answer.table?.map((r:any, i:number)=><tr key={i}>{Object.keys(r).map(k=><td key={k}>{String(r[k] ?? '')}</td>)}</tr>)}</tbody></table>
-      </div>}
+      </>}
 
-      <h2 style={{marginTop:24}}>Command Connection / System Health</h2>
-      <button onClick={loadDiag}>Test Connection</button>
-      <button onClick={testExpiring} style={{marginLeft:8}}>Expiring Cert Test (7d)</button>
-      {diag && <div style={{marginTop:12,padding:12,border:'1px solid #ddd'}}>
-        <p>Last checked: {diag.timestamp}</p>
-        <p>Command reachable: {String(diag.keyfactor?.command_reachable)}</p>
-        <p>Swagger URL: {diag.keyfactor?.swagger_url}</p>
-        <p>Swagger status: {String(diag.keyfactor?.swagger_status)}</p>
-        <p>Auth status: {String(diag.keyfactor?.auth_ok)}</p>
-        <p>Certificate search status: {String(diag.keyfactor?.cert_search_status)}</p>
-        <p>Error: {diag.keyfactor?.error || 'none'}</p>
-        <p>Diagnosis: {diag.keyfactor?.diagnosis}</p>
-        <p>Model reachable: {String(diag.model?.reachable)}</p>
-        <p>Database OK: {String(diag.database?.ok)}</p>
-      </div>}
-      {expTest && <div style={{marginTop:12,padding:12,border:'1px solid #ddd'}}>
-        <p>Expiring test count (days={expTest.days}): {expTest.count}</p>
-      </div>}
+      {page === 'diagnostics' && <>
+        <h1>System Health</h1><button onClick={loadDiag}>Refresh</button>
+        {diag && <div style={{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:10,marginTop:12}}>
+          <div style={cardStyle}><b>Frontend status</b><div>{diag.frontend_status}</div></div>
+          <div style={cardStyle}><b>Backend status</b><div>{diag.backend_status}</div></div>
+          <div style={cardStyle}><b>Last timestamp</b><div>{diag.timestamp}</div></div>
+          <div style={cardStyle}><b>Keyfactor API reachable</b><div>{String(diag.keyfactor?.api_reachable)}</div></div>
+          <div style={cardStyle}><b>Keyfactor auth</b><div>{String(diag.keyfactor?.authenticated)}</div></div>
+          <div style={cardStyle}><b>Endpoint tested</b><div>{diag.keyfactor?.endpoint_tested}</div></div>
+          <div style={cardStyle}><b>HTTP status code</b><div>{String(diag.keyfactor?.http_status_code)}</div></div>
+          <div style={cardStyle}><b>Ollama status</b><div>{diag.ollama?.status}</div></div>
+          <div style={cardStyle}><b>Model</b><div>{diag.ollama?.model}</div></div>
+        </div>}
+      </>}
+
+      {page === 'audit' && <div style={cardStyle}><h2>Audit Page Placeholder</h2><p>Detailed audit table/charts can be added next.</p></div>}
     </main>
   </div>
 }

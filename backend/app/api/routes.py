@@ -26,16 +26,11 @@ def health():
     return {"ok": True, "version": settings.app_version}
 
 
-@router.post("/command/test")
-def test_command():
-    return KeyfactorClient().health_check()
-
-
 @router.get("/keyfactor/diagnostics")
 def keyfactor_diagnostics(db: Session = Depends(get_db)):
     kf = KeyfactorClient()
     health = kf.health_check()
-    model_status = summarize_with_llm("health", "model check") != "model check"
+    _, model_ok = summarize_with_llm("health", "model check")
     db_ok = True
     db_error = ""
     try:
@@ -46,15 +41,12 @@ def keyfactor_diagnostics(db: Session = Depends(get_db)):
 
     return {
         "timestamp": now_iso(),
+        "frontend_status": "served_by_nginx",
+        "backend_status": "running",
         "app_name": settings.app_name,
         "app_version": settings.app_version,
-        "env_loaded": True,
-        "keyfactor": {
-            **health,
-            "username": kf._masked_username(),
-            "password": "********",
-        },
-        "model": {"provider": settings.llm_provider, "model": settings.ollama_model, "reachable": model_status},
+        "keyfactor": {**health, "username": kf._masked_username(), "password": "********"},
+        "ollama": {"provider": settings.llm_provider, "model": settings.ollama_model, "status": "connected" if model_ok else "unavailable"},
         "database": {"ok": db_ok, "error": db_error},
     }
 
@@ -69,7 +61,6 @@ def keyfactor_test_expiring(days: int = Query(default=7, ge=0, le=365)):
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, db: Session = Depends(get_db)):
     tool, params = classify_prompt(req.prompt)
-    logger.info("Selected tool=%s params=%s", tool, params)
     kf = KeyfactorClient()
     health = kf.health_check()
 
@@ -78,29 +69,31 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
     answer = ""
     diagnostic = None
 
-    if not health.get("command_reachable"):
+    if not health.get("api_reachable"):
         source = "unavailable"
-        answer = f"Command API is not reachable. Tested {health.get('swagger_url')} and got status {health.get('swagger_status')}. Error: {health.get('error') or 'n/a'}"
+        answer = f"Network or TLS connectivity issue. Endpoint tested: {health.get('endpoint_tested')}."
         diagnostic = health
         tool = "none"
-    elif not health.get("auth_ok"):
+    elif not health.get("authenticated") and health.get("http_status_code") == 401:
         source = "unavailable"
-        answer = f"Command is reachable but authentication/API call failed. Status: {health.get('cert_search_status')}."
+        answer = "Authentication failed while accessing Keyfactor API."
+        diagnostic = health
+        tool = "none"
+    elif health.get("http_status_code") == 403:
+        source = "unavailable"
+        answer = "Keyfactor API reachable but permission denied for this account."
         diagnostic = health
         tool = "none"
     else:
         try:
             if tool == "count_expiring_certificates":
-                raw = kf.get_expiring_certificates(params["days"])
-                table = format_expiring_rows(raw)
+                table = format_expiring_rows(kf.get_expiring_certificates(params["days"]))
                 facts = f"There are {len(table)} certificates expiring in the next {params['days']} days."
             elif tool == "get_expiring_certificates":
-                raw = kf.get_expiring_certificates(params["days"])
-                table = format_expiring_rows(raw)
-                facts = f"Found {len(table)} certificates for the requested expiry range."
+                table = format_expiring_rows(kf.get_expiring_certificates(params["days"]))
+                facts = f"Found {len(table)} certificates expiring in {params['days']} days."
             elif tool == "get_expired_certificates":
-                raw = kf.get_expiring_certificates(0)
-                table = format_expiring_rows(raw)
+                table = format_expiring_rows(kf.get_expiring_certificates(0))
                 facts = f"Found {len(table)} expired certificates."
             elif tool == "get_failed_orchestrator_jobs":
                 rows = kf.get_orchestrator_jobs()
@@ -110,15 +103,12 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
                 summary = kf.get_inventory_summary()
                 table = [summary]
                 facts = f"Inventory summary total certificates: {summary.get('total_certificates', 0)}."
-
-            answer = summarize_with_llm(req.prompt, facts)
+            answer, _ = summarize_with_llm(req.prompt, facts)
         except Exception as exc:
-            logger.exception("Tool execution failed")
             source = "unavailable"
-            answer = f"Command request failed while executing tool {tool}: {str(exc)}"
+            answer = f"Tool execution failed: {exc}"
             diagnostic = health
 
-    logger.info("Chat result tool=%s result_count=%s source=%s", tool, len(table), source)
     row = AuditLog(
         username=req.username,
         prompt=req.prompt,

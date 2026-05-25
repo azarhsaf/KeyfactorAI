@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import logging
+from typing import Any
 import httpx
 from app.core.config import settings
 
@@ -14,6 +15,9 @@ class KeyfactorClient:
 
     def _masked_username(self) -> str:
         username = settings.keyfactor_username.strip().strip('"').strip("'")
+        if "@" in username:
+            left, right = username.split("@", 1)
+            return f"{left[:2]}***@{right}"
         if "\\" in username:
             domain, user = username.split("\\", 1)
             return f"{domain}\\{user[:2]}***"
@@ -21,7 +25,7 @@ class KeyfactorClient:
 
     def _resolved_username(self) -> str:
         username = settings.keyfactor_username.strip().strip('"').strip("'")
-        if "\\" in username:
+        if "\\" in username or "@" in username:
             return username
         if settings.keyfactor_domain:
             return f"{settings.keyfactor_domain}\\{username}"
@@ -29,107 +33,94 @@ class KeyfactorClient:
 
     def _auth(self):
         if settings.keyfactor_auth_type.lower() == "basic":
-            user = self._resolved_username()
-            logger.info("Using basic auth with username=%s", self._masked_username())
-            return (user, settings.keyfactor_password)
+            return (self._resolved_username(), settings.keyfactor_password)
         return None
 
     def _get_headers(self):
         return {
             "x-keyfactor-requested-with": "APIClient",
             "Accept": "application/json",
-            "Content-Type": "application/json",
         }
 
     def _client(self):
+        logger.info("Keyfactor client init base=%s user=%s", self.base, self._masked_username())
         return httpx.Client(verify=settings.keyfactor_verify_tls, timeout=settings.keyfactor_timeout, auth=self._auth(), headers=self._get_headers())
 
-    def health_check(self):
-        swagger_url = f"{self.base}/swagger/index.html"
-        cert_search_url = f"{self.base}/Certificates/Search"
-        diag = {
+    def health_check(self) -> dict[str, Any]:
+        endpoint = f"{self.base}/Certificates"
+        diag: dict[str, Any] = {
             "ok": False,
-            "base_url": self.base_url,
-            "api_path": self.api_path,
-            "swagger_url": swagger_url,
-            "swagger_status": None,
-            "cert_search_url": cert_search_url,
-            "cert_search_status": None,
-            "command_reachable": False,
-            "auth_ok": False,
+            "status": "disconnected",
+            "api_reachable": False,
+            "authenticated": False,
+            "permission_denied": False,
+            "endpoint_tested": endpoint,
+            "http_status_code": None,
+            "message": "",
             "error": "",
-            "diagnosis": "",
         }
-        logger.info("Starting Keyfactor health check swagger=%s cert_search=%s", swagger_url, cert_search_url)
+        logger.info("Starting Keyfactor health check endpoint=%s", endpoint)
         try:
             with self._client() as c:
-                swagger = c.get(swagger_url)
-                diag["swagger_status"] = swagger.status_code
-                if swagger.status_code == 200:
-                    diag["command_reachable"] = True
+                r = c.get(endpoint)
+                diag["http_status_code"] = r.status_code
+                diag["api_reachable"] = True
+                if r.status_code == 200:
+                    diag.update({"ok": True, "status": "connected", "authenticated": True, "message": "Connected and authenticated"})
+                elif r.status_code == 401:
+                    diag.update({"status": "auth_failed", "authenticated": False, "message": "Authentication failed"})
+                elif r.status_code == 403:
+                    diag.update({"status": "permission_denied", "authenticated": True, "permission_denied": True, "message": "Permission denied"})
+                elif r.status_code == 405:
+                    diag.update({"status": "method_or_endpoint_error", "message": "Wrong method or endpoint"})
                 else:
-                    diag["diagnosis"] = "Command API not reachable"
-                    diag["error"] = f"Swagger status: {swagger.status_code}"
-                    return diag
-
-                payload = {"PageReturned": 1, "ReturnLimit": 1, "QueryString": "", "IncludeRevoked": False}
-                cert = c.post(cert_search_url, json=payload)
-                diag["cert_search_status"] = cert.status_code
-
-                if cert.status_code == 200:
-                    diag["ok"] = True
-                    diag["auth_ok"] = True
-                    diag["diagnosis"] = "Command reachable and authentication successful"
-                elif cert.status_code in (401, 403):
-                    diag["diagnosis"] = "Command reachable but authentication failed"
-                    diag["error"] = cert.text[:500]
-                else:
-                    diag["diagnosis"] = "Command reachable but API call failed"
-                    diag["error"] = cert.text[:500]
-
-                logger.info("Keyfactor health result swagger_status=%s cert_status=%s diagnosis=%s", diag["swagger_status"], diag["cert_search_status"], diag["diagnosis"])
+                    diag.update({"status": "api_error", "message": f"API responded with HTTP {r.status_code}", "error": r.text[:500]})
                 return diag
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+            diag.update({"status": "network_error", "api_reachable": False, "authenticated": False, "message": "Network or TLS connectivity issue", "error": str(exc)})
+            return diag
         except Exception as exc:
-            diag["diagnosis"] = "Command API not reachable"
-            diag["error"] = str(exc)
-            logger.exception("Keyfactor health check failed")
+            diag.update({"status": "unknown_error", "api_reachable": False, "authenticated": False, "message": "Network or TLS connectivity issue", "error": str(exc)})
             return diag
 
-    def list_certificates(self, page_size: int = 100):
-        return self.search_certificates({"PageReturned": 1, "ReturnLimit": page_size, "QueryString": "", "IncludeRevoked": False})
-
-    def search_certificates(self, payload: dict):
+    def list_certificates(self):
         with self._client() as c:
-            r = c.post(f"{self.base}/Certificates/Search", json=payload)
+            r = c.get(f"{self.base}/Certificates")
             r.raise_for_status()
             return r.json()
 
+    def search_certificates(self, payload: dict):
+        logger.info("Certificates/Search unsupported in this deployment; using list_certificates fallback")
+        return self.list_certificates()
+
+    def _rows(self, raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            for key in ["Certificates", "Items", "Data"]:
+                if isinstance(raw.get(key), list):
+                    return raw[key]
+        return []
+
     def get_expiring_certificates(self, days: int):
-        end_dt = datetime.now(timezone.utc) + timedelta(days=days)
-        primary = {
-            "PageReturned": 1,
-            "ReturnLimit": 250,
-            "QueryString": "",
-            "IncludeRevoked": False,
-            "ExpirationDate": {"End": end_dt.isoformat()},
-        }
-        url = f"{self.base}/Certificates/Search"
-        with self._client() as c:
-            r = c.post(url, json=primary)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 400:
-                fallback = {
-                    "PageReturned": 1,
-                    "ReturnLimit": 250,
-                    "QueryString": f"Expires <= {end_dt.date().isoformat()}",
-                    "IncludeRevoked": False,
-                }
-                r2 = c.post(url, json=fallback)
-                if r2.status_code == 200:
-                    return r2.json()
-                raise RuntimeError({"url": url, "status_code": r2.status_code, "response": r2.text[:500]})
-            raise RuntimeError({"url": url, "status_code": r.status_code, "response": r.text[:500]})
+        rows = self._rows(self.list_certificates())
+        now = datetime.now(timezone.utc)
+        end = now + timedelta(days=days)
+        out = []
+        for cert in rows:
+            not_after = cert.get("NotAfter") or cert.get("ExpirationDate")
+            if not not_after:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(not_after).replace("Z", "+00:00"))
+                if days == 0:
+                    if dt <= now:
+                        out.append(cert)
+                elif now <= dt <= end:
+                    out.append(cert)
+            except Exception:
+                continue
+        return out
 
     def get_certificate_by_id(self, cert_id: int):
         with self._client() as c:
@@ -156,6 +147,5 @@ class KeyfactorClient:
             return r.json()
 
     def get_inventory_summary(self):
-        certs = self.list_certificates()
-        rows = certs if isinstance(certs, list) else certs.get("Certificates", certs.get("Items", []))
+        rows = self._rows(self.list_certificates())
         return {"total_certificates": len(rows)}

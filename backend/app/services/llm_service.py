@@ -2,11 +2,14 @@ import httpx
 from app.core.config import settings
 
 
-def summarize_with_llm(prompt: str, facts: str) -> str:
+FALLBACK_MESSAGE = "AI summary unavailable, but deterministic Keyfactor result is available."
+
+
+def summarize_with_llm(prompt: str, facts: str) -> tuple[str, bool]:
     if settings.llm_provider != "ollama":
-        return facts
+        return facts, False
     try:
-        with httpx.Client(timeout=60) as c:
+        with httpx.Client(timeout=30) as c:
             r = c.post(
                 f"{settings.ollama_base_url}/api/generate",
                 json={
@@ -15,7 +18,9 @@ def summarize_with_llm(prompt: str, facts: str) -> str:
                     "stream": False,
                 },
             )
+            if r.status_code == 404:
+                return f"{facts} {FALLBACK_MESSAGE}", False
             r.raise_for_status()
-            return r.json().get("response", facts)
+            return r.json().get("response", facts), True
     except Exception:
-        return facts
+        return f"{facts} {FALLBACK_MESSAGE}", False
