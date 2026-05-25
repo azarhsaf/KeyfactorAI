@@ -15,7 +15,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     source: str
-    timestamp: str
     tool: str
+    result_count: int
+    ai_summary_status: str
+    timestamp: str
     table: list[dict[str, Any]]
     diagnostics: dict[str, Any] | None = None
